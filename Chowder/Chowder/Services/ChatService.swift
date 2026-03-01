@@ -47,14 +47,25 @@ final class ChatService: NSObject {
     private var seenSequenceNumbers: Set<Int> = []
     private var seenToolCallIds: Set<String> = []  // Dedupe by toolCallId
     private var seenTimestamps: Set<String> = []   // Fallback dedupe by timestamp
-    private let historyPollInterval: TimeInterval = 1.0  // 1 second
+    private let historyFastPollInterval: TimeInterval = 0.75
+    private let historySteadyPollInterval: TimeInterval = 2.0
+    private let historyBackoffPollInterval: TimeInterval = 5.0
+    private let historySteadyTransitionAfter: TimeInterval = 12.0
     private let historyRequestTimeout: TimeInterval = 8.0
+    private var historyPollingStartedAt: Date?
+    private var historyConsecutiveTimeouts: Int = 0
+    private var historyCurrentPollInterval: TimeInterval = 0.75
     private var pendingForegroundSendRequestIds: Set<String> = []
     private var pendingBackgroundSendRequestIds: Set<String> = []
     private var pendingForegroundSendStartedAt: [String: Date] = [:]
     private var visibleRunId: String?
     private var visibleRunStartedAt: Date?
     private var hiddenRunIds: Set<String> = []
+    private let reconnectBaseDelay: TimeInterval = 1.5
+    private let reconnectMaxDelay: TimeInterval = 45
+    private let reconnectJitterRatio: Double = 0.25
+    private var reconnectAttemptCount: Int = 0
+    private var reconnectWorkItem: DispatchWorkItem?
 
     init(gatewayURL: String, token: String, sessionKey: String = "agent:main:main") {
         self.gatewayURL = gatewayURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -80,10 +91,30 @@ final class ChatService: NSObject {
     }
 
     private func log(_ msg: String) {
-        print("🔌 \(msg)")
+        let safe = redactedLogMessage(msg)
+        print("🔌 \(safe)")
         DispatchQueue.main.async { [weak self] in
-            self?.delegate?.chatServiceDidLog(msg)
+            self?.delegate?.chatServiceDidLog(safe)
         }
+    }
+
+    /// Redact sensitive values before emitting debug logs.
+    private func redactedLogMessage(_ message: String) -> String {
+        var redacted = message
+        if !token.isEmpty {
+            redacted = redacted.replacingOccurrences(of: token, with: "[REDACTED_TOKEN]")
+        }
+        redacted = redacted.replacingOccurrences(
+            of: #""token"\s*:\s*"[^"]+""#,
+            with: #""token":"[REDACTED_TOKEN]""#,
+            options: .regularExpression
+        )
+        redacted = redacted.replacingOccurrences(
+            of: #"([?&]token=)[^&\s]+"#,
+            with: "$1[REDACTED_TOKEN]",
+            options: .regularExpression
+        )
+        return redacted
     }
 
     /// Produce a one-line summary for incoming WebSocket frames instead of dumping raw JSON.
@@ -145,6 +176,8 @@ final class ChatService: NSObject {
         shouldReconnect = true
         hasSentConnectRequest = false
         nextRequestId = 1
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
 
         // Build URL — only append ?client= if not already present
         let urlString: String
@@ -177,6 +210,10 @@ final class ChatService: NSObject {
         log("[DISCONNECT] Manual disconnect")
         shouldReconnect = false
         stopHistoryPolling()
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectAttemptCount = 0
+        isReconnecting = false
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         urlSession?.invalidateAndCancel()
@@ -308,9 +345,41 @@ final class ChatService: NSObject {
             self.pendingHistoryRequestIds.remove(requestId)
             self.historyRequestInFlight = false
             self.historyPollTimeoutCount += 1
+            self.historyConsecutiveTimeouts += 1
             self.log("[HISTORY] ⚠️ Poll request timed out — unblocking next poll")
             self.logHistoryPollStats(reason: "timeout")
+            self.updateHistoryPollingTimerIfNeeded()
         }
+    }
+
+    private func computeHistoryPollInterval() -> TimeInterval {
+        guard activeRunId != nil else { return historyFastPollInterval }
+
+        if historyConsecutiveTimeouts >= 2 {
+            return historyBackoffPollInterval
+        }
+
+        let elapsed = Date().timeIntervalSince(historyPollingStartedAt ?? Date())
+        if elapsed >= historySteadyTransitionAfter {
+            return historySteadyPollInterval
+        }
+        return historyFastPollInterval
+    }
+
+    private func updateHistoryPollingTimerIfNeeded(force: Bool = false) {
+        guard activeRunId != nil else { return }
+        let nextInterval = computeHistoryPollInterval()
+        if !force && abs(nextInterval - historyCurrentPollInterval) < 0.01 {
+            return
+        }
+
+        historyCurrentPollInterval = nextInterval
+        historyPollTimer?.invalidate()
+        historyPollTimer = Timer.scheduledTimer(withTimeInterval: nextInterval, repeats: true) { [weak self] _ in
+            self?.requestChatHistory()
+        }
+        historyPollTimer?.tolerance = min(0.5, nextInterval * 0.25)
+        log("[HISTORY] Timer interval set to \(String(format: "%.2fs", nextInterval))")
     }
 
     /// Start polling chat.history (no runId needed - gateway doesn't provide it)
@@ -323,18 +392,15 @@ final class ChatService: NSObject {
         seenSequenceNumbers.removeAll()
         seenToolCallIds.removeAll()
         seenTimestamps.removeAll()
-        
-        log("[HISTORY] Starting poll (\(Int(historyPollInterval * 1000))ms interval)")
-        
-        // Poll immediately, then every 500ms
+        historyPollingStartedAt = Date()
+        historyConsecutiveTimeouts = 0
+        historyCurrentPollInterval = historyFastPollInterval
+
+        log("[HISTORY] Starting adaptive poll")
+
+        // Poll immediately, then on an adaptive timer.
         requestChatHistory()
-        
-        historyPollTimer = Timer.scheduledTimer(
-            withTimeInterval: historyPollInterval,
-            repeats: true
-        ) { [weak self] _ in
-            self?.requestChatHistory()
-        }
+        updateHistoryPollingTimerIfNeeded(force: true)
     }
 
     /// Restart polling after a reconnection during an active run.
@@ -357,6 +423,9 @@ final class ChatService: NSObject {
         seenSequenceNumbers.removeAll()
         seenToolCallIds.removeAll()
         seenTimestamps.removeAll()
+        historyPollingStartedAt = nil
+        historyConsecutiveTimeouts = 0
+        historyCurrentPollInterval = historyFastPollInterval
         log("[HISTORY] Stopped polling")
     }
 
@@ -430,7 +499,7 @@ final class ChatService: NSObject {
             return
         }
 
-        log("[AUTH] Sending connect request: \(jsonString)")
+        log("[AUTH] Sending connect request id=\(requestId) role=operator scopes=operator.read,operator.write")
         webSocketTask?.send(.string(jsonString)) { [weak self] error in
             if let error {
                 self?.log("[AUTH] ❌ Error sending connect: \(error.localizedDescription)")
@@ -711,6 +780,7 @@ final class ChatService: NSObject {
             if payloadType == "hello-ok" {
                 let proto = payload?["protocol"] as? Int ?? 0
                 log("[AUTH] ✅ hello-ok — protocol=\(proto) id=\(id)")
+                reconnectAttemptCount = 0
 
                 DispatchQueue.main.async { [weak self] in
                     self?.isConnected = true
@@ -723,6 +793,10 @@ final class ChatService: NSObject {
             if payloadType == "chat-history" || payloadType == "history" {
                 if let messages = payload?["messages"] as? [[String: Any]] {
                     self.log("[HISTORY] ✅ Received \(messages.count) history items")
+                    if self.historyConsecutiveTimeouts > 0 {
+                        self.historyConsecutiveTimeouts = 0
+                        self.updateHistoryPollingTimerIfNeeded()
+                    }
                     // Log first few items for debugging
                     if messages.count > 0 {
                         self.log("[HISTORY] Sample item keys: \(Array(messages[0].keys))")
@@ -749,6 +823,10 @@ final class ChatService: NSObject {
                 // Try to find messages array even without type field
                 if let messages = payload?["messages"] as? [[String: Any]] {
                     self.log("[HISTORY] 🎯 Found messages array in response without type! Count: \(messages.count)")
+                    if self.historyConsecutiveTimeouts > 0 {
+                        self.historyConsecutiveTimeouts = 0
+                        self.updateHistoryPollingTimerIfNeeded()
+                    }
                     if messages.count > 0 {
                         self.log("[HISTORY] First item keys: \(Array(messages[0].keys))")
                     }
@@ -975,17 +1053,25 @@ final class ChatService: NSObject {
     private func attemptReconnect() {
         guard shouldReconnect, !isReconnecting else { return }
         isReconnecting = true
-        log("[RECONNECT] Will retry in 3s ...")
+        let baseDelay = min(reconnectMaxDelay, reconnectBaseDelay * pow(2.0, Double(reconnectAttemptCount)))
+        let jitterMultiplier = Double.random(in: (1.0 - reconnectJitterRatio)...(1.0 + reconnectJitterRatio))
+        let delay = max(1.0, baseDelay * jitterMultiplier)
+        reconnectAttemptCount += 1
+
+        log("[RECONNECT] Attempt #\(reconnectAttemptCount) in \(String(format: "%.1f", delay))s")
         stopHistoryPolling()  // Stop polling timer before reconnecting
         webSocketTask = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
-
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.isReconnecting = false
-            self?.log("[RECONNECT] Retrying now")
-            self?.connect()
+        reconnectWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.isReconnecting = false
+            self.log("[RECONNECT] Retrying now")
+            self.connect()
         }
+        reconnectWorkItem = workItem
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     // MARK: - Poll Diagnostics
@@ -1029,16 +1115,21 @@ extension ChatService: URLSessionWebSocketDelegate {
         }
     }
 
-    // Trust Tailscale's .ts.net TLS certificates
+    // Validate TLS trust before accepting the server certificate.
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         let host = challenge.protectionSpace.host
         log("[TLS] Challenge for host=\(host) method=\(challenge.protectionSpace.authenticationMethod)")
 
         if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           host.hasSuffix(".ts.net"),
            let trust = challenge.protectionSpace.serverTrust {
-            log("[TLS] Trusting .ts.net certificate for \(host)")
-            completionHandler(.useCredential, URLCredential(trust: trust))
+            var trustError: CFError?
+            if SecTrustEvaluateWithError(trust, &trustError) {
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            } else {
+                let reason = (trustError as Error?)?.localizedDescription ?? "unknown trust failure"
+                log("[TLS] ❌ Trust evaluation failed for \(host): \(reason)")
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            }
             return
         }
 

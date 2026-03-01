@@ -48,6 +48,7 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
     }
 
     func requestForegroundRefresh() {
+        guard sharingEnabled else { return }
         pendingOneShotSource = .foregroundRefresh
         manager.requestLocation()
     }
@@ -124,6 +125,7 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard sharingEnabled else { return }
         guard let location = locations.last else { return }
         let source = pendingOneShotSource ?? .significantChange
         pendingOneShotSource = nil

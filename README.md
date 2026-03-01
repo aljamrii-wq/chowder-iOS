@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/5af73b21-0ec1-4804-8a40-39dbd2f10adb
   - "exec completed (859ms)"
 - **Custom agent avatar** -- pick a profile photo for the agent from your photo library
 - **Settings sync** -- edit the bot's identity or your user profile in Settings and the changes are written back to the OpenClaw workspace files
-- **Automatic reconnection** with 3-second backoff after network interruptions
+- **Automatic reconnection** with exponential backoff + jitter after network interruptions
 - **Debug log** -- tap the header to view raw WebSocket traffic for troubleshooting
 - **Demo mode** -- in Settings, you can run a demo (e.g. Live Activity) to try UI interactions without connecting to OpenClaw
 
@@ -41,6 +41,14 @@ https://github.com/user-attachments/assets/5af73b21-0ec1-4804-8a40-39dbd2f10adb
 - **iOS 17+** on the target device
 
 > Note: For higher-quality local task/completion summaries in the Live Activity and chat header, enable Apple Intelligence on the iOS device (Settings > Apple Intelligence & Siri). If unavailable or disabled, summaries may be less polished.
+
+## Security Notes
+
+- Gateway tokens are stored in the iOS Keychain (`WhenUnlockedThisDeviceOnly` accessibility).
+- Debug logs redact authentication tokens.
+- ATS is scoped to local/Tailscale networking instead of allowing arbitrary network loads.
+- Location sync remains opt-in and foreground refresh requests are ignored when location sharing is disabled.
+- Prefer `wss://` when your gateway is configured with TLS; use `ws://` only on trusted private tailnets.
 
 ## Architecture
 
@@ -67,7 +75,7 @@ iPhone (Chowder)                Mac mini (Gateway)
       |------------------------------>|
       |  agent/lifecycle (phase:start)|  --> start polling chat.history
       |<------------------------------|
-      |  chat.history polling (500ms) |  --> extract thinking + toolCall from content[]
+      |  chat.history polling (adaptive)|  --> extract thinking + toolCall from content[]
       |------------------------------>|
       |  assistant content arrays     |  --> "Appending to weather.txt...", "Updated weather.txt (13ms)"
       |<------------------------------|
@@ -195,7 +203,7 @@ Chowder dynamically mirrors the bot's workspace files -- it never hardcodes iden
 
 ### Real-Time Activity Tracking
 
-Chowder polls `chat.history` every 500ms while the agent is running (from `lifecycle:start` to `lifecycle:end`). Each history response returns the most recent messages, which Chowder parses to extract activity and show progress to the user.
+Chowder polls `chat.history` on an adaptive interval while the agent is running (from `lifecycle:start` to `lifecycle:end`): fast (750ms) at start, then steady (2s), with temporary backoff (5s) on repeated history timeouts. Each history response returns the most recent messages, which Chowder parses to extract activity and show progress to the user.
 
 #### History Item Schema
 
@@ -281,7 +289,7 @@ Messages are sent as `chat.send` requests with an idempotency key. The gateway a
 
 ### Reconnection
 
-Chowder automatically reconnects after network interruptions with a 3-second backoff.
+Chowder automatically reconnects after network interruptions using exponential backoff with jitter (capped), which smooths reconnect spikes when many clients recover at once.
 
 ## Troubleshooting
 

@@ -194,6 +194,32 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
         pastTenseCache.removeAll()
     }
 
+    /// Format cumulative run cost for Live Activity display with enough precision
+    /// for low-cost runs while staying compact for larger totals.
+    private static func formatLiveActivityCost(_ total: Double) -> String {
+        if total < 0.1 {
+            return String(format: "$%.4f", total)
+        }
+        if total < 1 {
+            return String(format: "$%.3f", total)
+        }
+        return String(format: "$%.2f", total)
+    }
+
+    /// Accumulate usage/cost payload from a history item, if present.
+    private func accumulateUsageCost(from item: [String: Any], source: String) {
+        guard let usage = item["usage"] as? [String: Any],
+              let cost = usage["cost"] as? [String: Any],
+              let total = cost["total"] as? Double,
+              total > 0 else {
+            return
+        }
+
+        liveActivityCostAccumulator += total
+        liveActivityCost = Self.formatLiveActivityCost(liveActivityCostAccumulator)
+        log("💰 Cost accumulated (\(source)): \(liveActivityCost ?? "$0.0000") (+\(String(format: "$%.4f", total)))")
+    }
+
     /// Generate a completion summary for the finished turn from the
     /// final assistant response text.
     private func generateCompletionSummary() async -> String? {
@@ -626,8 +652,14 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
             )
         }
 
-        // Update the Live Activity on the Lock Screen
-        LiveActivityManager.shared.updateIntent("Thinking...")
+        // Keep Lock Screen intent in sync while waiting for structured history items.
+        // Avoid resetting the full activity state via the simplified updateIntent API.
+        let didChange = liveActivityBottomText != "Thinking..." || liveActivityCurrentIcon != ToolCategory.thinking.iconName
+        if didChange {
+            liveActivityBottomText = "Thinking..."
+            liveActivityCurrentIcon = ToolCategory.thinking.iconName
+            pushLiveActivityUpdate()
+        }
     }
 
     func chatServiceDidReceiveToolEvent(name: String, path: String?, args: [String: Any]?) {
@@ -644,6 +676,7 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
         // Build a human-readable label from the tool name + args
         let label = Self.friendlyLabel(for: name, path: path, args: args)
         let detail = Self.detailString(for: name, path: path, args: args)
+        let liveCategory = deriveIntentFromToolCall(name: name, arguments: args ?? [:]).category
 
         log("Setting shimmer label: '\(label)'")
         currentActivity?.currentLabel = label
@@ -652,8 +685,12 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
         )
         log("Activity now has \(currentActivity?.steps.count ?? 0) total steps (\(currentActivity?.completedSteps.count ?? 0) completed)")
 
-        // Update the Live Activity on the Lock Screen
-        LiveActivityManager.shared.updateIntent(label)
+        // Keep Lock Screen intent in sync while waiting for structured history items.
+        if liveActivityBottomText != label || liveActivityCurrentIcon != liveCategory.iconName {
+            liveActivityBottomText = label
+            liveActivityCurrentIcon = liveCategory.iconName
+            pushLiveActivityUpdate()
+        }
     }
 
     // MARK: - Friendly Tool Labels
@@ -854,15 +891,8 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
             }
         }
         
-        // Accumulate usage/cost data if present at the item level
-        if let usage = item["usage"] as? [String: Any] {
-            if let cost = usage["cost"] as? [String: Any],
-               let total = cost["total"] as? Double, total > 0 {
-                liveActivityCostAccumulator += total
-                liveActivityCost = String(format: "$%.3f", liveActivityCostAccumulator)
-                log("💰 Cost accumulated: \(liveActivityCost!) (+\(total))")
-            }
-        }
+        // Accumulate usage/cost once per history item (toolResult included).
+        accumulateUsageCost(from: item, source: role)
 
         log("📋 Processing history item: role=\(role)")
         
@@ -1046,14 +1076,6 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
         guard let toolCallId = item["toolCallId"] as? String else {
             return
         }
-        
-        // Accumulate cost from toolResult usage if present
-        if let usage = item["usage"] as? [String: Any],
-           let cost = usage["cost"] as? [String: Any],
-           let total = cost["total"] as? Double, total > 0 {
-            liveActivityCostAccumulator += total
-            liveActivityCost = String(format: "$%.3f", liveActivityCostAccumulator)
-        }
 
         // Always mark in-progress steps (including the matching tool call) as completed
         currentActivity?.finishCurrentSteps()
@@ -1088,6 +1110,12 @@ final class ChatViewModel: ChatServiceDelegate, LocationServiceDelegate {
         currentActivity?.steps.append(
             ActivityStep(type: .toolCall, label: completionLabel, detail: "", status: .completed, toolCategory: category)
         )
+
+        // Stream completion + latest cost to the Lock Screen immediately.
+        liveActivityBottomText = completionLabel
+        liveActivityCurrentIcon = category.iconName
+        liveActivityStepNumber = (currentActivity?.steps.count ?? liveActivityStepNumber)
+        pushLiveActivityUpdate()
     }
 
     /// Result of classifying a tool call — provides both a display label and category for icon selection.
